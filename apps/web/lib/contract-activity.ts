@@ -22,6 +22,7 @@
  * The "contract id" arguments are the `C…` address, scoped by network, as
  * `Contract` is unique on that pair.
  */
+import { cache } from 'react';
 import { isValidHandle, type Network } from '@signet/types';
 import { STELLAR_NETWORK } from './chain.ts';
 import { attributeContract, type Attribution } from './contract-attribution.ts';
@@ -155,10 +156,23 @@ const defaultDb: ContractActivityDb = {
   },
 };
 
-/** The newest snapshot for a contract, or `null` when it is absent or unmeasured. */
-export async function getContractActivity(
+/**
+ * The newest snapshot for a contract, or `null` when it is absent or unmeasured.
+ * With the default dependencies it is read once per render (React `cache`, #458);
+ * a caller that injects its own `deps` is always read fresh.
+ */
+export function getContractActivity(
   contractId: string,
-  deps: ContractActivityDeps = {},
+  deps?: ContractActivityDeps,
+): Promise<ContractActivity> {
+  return deps === undefined ? contractActivityOncePerRender(contractId) : readContractActivity(contractId, deps);
+}
+
+const contractActivityOncePerRender = cache((contractId: string) => readContractActivity(contractId, {}));
+
+async function readContractActivity(
+  contractId: string,
+  deps: ContractActivityDeps,
 ): Promise<ContractActivity> {
   const db = deps.db ?? defaultDb;
   const rows = await db.listSnapshots({
