@@ -40,6 +40,13 @@ import { STELLAR_NETWORK } from './chain.ts';
 import { deriveContractId, isContractAddress } from './contract-address.ts';
 import { getProfile } from './profiles.ts';
 import { HORIZON_MAX_RECORDS } from './server/horizon.ts';
+import {
+  ATTRIBUTION_HIT_TTL_SECONDS,
+  MissMemo,
+  contractTag,
+  nextDataCache,
+  type DataCache,
+} from './server/contract-cache.ts';
 import { xdr, StrKey } from '@stellar/stellar-sdk';
 
 /** A contract attributed to a handle, ready to render. */
@@ -139,7 +146,7 @@ export interface AttributeContractDeps {
 
 const CREATE_CONTRACT_FUNCTION = 'HostFunctionTypeCreateContract';
 
-const defaultDb: AttributionDb = {
+const prismaAttributionDb: AttributionDb = {
   findContract: async ({ address, handle, network }) => {
     if (!process.env.DATABASE_URL) return undefined;
     try {
@@ -168,6 +175,44 @@ const defaultDb: AttributionDb = {
     }
   },
 };
+
+/**
+ * Puts the cross-request caches (#458, `./server/contract-cache.ts`) in front of
+ * a database seam: a match is remembered for 5 minutes in Next's data cache,
+ * tagged `contract:{address}`; a miss for 30 seconds in process, so a
+ * deployment the indexer has just recorded appears quickly. `undefined` ("no
+ * database") is never remembered: an outage must not look like a verdict, and
+ * must not outlive its cause.
+ */
+export function withAttributionCache(
+  inner: AttributionDb,
+  deps: { dataCache?: DataCache; misses?: MissMemo } = {},
+): AttributionDb {
+  const dataCache = deps.dataCache ?? nextDataCache;
+  const misses = deps.misses ?? new MissMemo();
+  return {
+    findContract: async (args) => {
+      // The query lower-cases the handle, so the cache must too.
+      const handle = args.handle.toLowerCase();
+      const missKey = [args.network, args.address, handle].join('|');
+      if (misses.has(missKey)) return null;
+
+      const row = await dataCache.remember<AttributionDbRow | null | undefined>({
+        key: ['contract-attribution', args.network, args.address, handle],
+        tags: [contractTag(args.address)],
+        ttlSeconds: ATTRIBUTION_HIT_TTL_SECONDS,
+        compute: async () => {
+          const found = await inner.findContract({ ...args, handle });
+          return { value: found, cache: found != null };
+        },
+      });
+      if (row === null) misses.remember(missKey);
+      return row;
+    },
+  };
+}
+
+const defaultDb: AttributionDb = withAttributionCache(prismaAttributionDb);
 
 const defaultHorizon: AttributionHorizon = {
   listWallets: async (handle: string) => {
